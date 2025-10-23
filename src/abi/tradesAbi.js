@@ -9,4 +9,5 @@ export const TRADES_ABI = [
   "event StopsUpdated(uint32 indexed id, int64 slX6, int64 tpX6)",
 
   // Closed (fermeture ou annulation)
-  "event Closed(uint32 indexed id, int64 execX6, int256 pnlUsd6,
+  "event Closed(uint32 indexed id, int64 execX6, int256 pnlUsd6, uint8 reason)"
+];
