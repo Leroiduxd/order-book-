@@ -30,7 +30,7 @@ const main = async () => {
 
       await upsertOpened({
         id: Number(id),
-        owner_addr: String(trader),                // ✅ vrai trader
+        owner_addr: String(trader).toLowerCase(),               // ✅ vrai trader
         asset_id: Number(asset),
         long_side: Boolean(longSide),
         lots: Number(lots),
