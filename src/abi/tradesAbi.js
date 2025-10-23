@@ -1,6 +1,6 @@
 export const TRADES_ABI = [
-  // Création d’une position (MARKET ou LIMIT)
-  "event Opened(uint32 indexed id, uint8 state, uint32 indexed asset, bool longSide, uint16 lots, int64 entryOrTargetX6, int64 slX6, int64 tpX6, int64 liqX6)",
+  // Opened avec trader + leverageX
+  "event Opened(uint32 indexed id, uint8 state, uint32 indexed asset, bool longSide, uint16 lots, int64 entryOrTargetX6, int64 slX6, int64 tpX6, int64 liqX6, address indexed trader, uint16 leverageX)",
 
   // LIMIT exécuté -> OPEN
   "event Executed(uint32 indexed id, int64 entryX6)",
