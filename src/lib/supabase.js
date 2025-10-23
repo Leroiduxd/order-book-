@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
 
+/* -------------------- CONFIG -------------------- */
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY =
   process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_ANON_KEY;
@@ -14,6 +15,7 @@ export const supa = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: false },
 });
 
+/* -------------------- UTILS -------------------- */
 function logErr(prefix, error, extra) {
   if (!error) return;
   console.error(`[Supabase] ${prefix} ERROR ->`, {
@@ -25,51 +27,46 @@ function logErr(prefix, error, extra) {
   });
 }
 
-/* -------------------- helpers assets & math -------------------- */
-
-async function getAsset(asset_id) {
-  const { data, error } = await supa
-    .from('assets')
-    .select('id,tick_x6,lot_num,lot_den')
-    .eq('id', asset_id)
-    .maybeSingle();
-  if (error) {
-    console.warn('[Supabase] getAsset warn', error.message);
-  }
-  return data || null;
-}
-
 const WAD = 10n ** 18n;
 
-function toBigIntSafe(v) {
+function toBI(v) {
   if (v === null || v === undefined) return 0n;
   if (typeof v === 'bigint') return v;
   if (typeof v === 'number') return BigInt(Math.trunc(v));
-  if (typeof v === 'string') return v.length ? BigInt(v) : 0n;
+  if (typeof v === 'string') return v.trim() ? BigInt(v) : 0n;
   return 0n;
 }
 
-// ceilDiv for BigInt
 function ceilDiv(a, b) {
   return (a + (b - 1n)) / b;
 }
 
-/* -------------------- buckets via RPC -------------------- */
+/* -------------------- ASSETS & BUCKETS -------------------- */
+async function getAsset(asset_id) {
+  const { data, error } = await supa
+    .from('assets')
+    .select('id, tick_x6, lot_num, lot_den')
+    .eq('id', asset_id)
+    .maybeSingle();
+  if (error) console.warn('[Supabase] getAsset warn', error.message);
+  return data || null;
+}
+
 async function priceToBucket(asset_id, price_x6) {
-  const px = toBigIntSafe(price_x6);
+  const px = toBI(price_x6);
   if (px === 0n) return null;
   const { data, error } = await supa.rpc('price_to_bucket', {
     _asset_id: asset_id,
     _price_x6: px.toString(),
   });
   if (error) {
-    console.warn('[Supabase] price_to_bucket warn', error.message);
+    console.warn('[Supabase] price_to_bucket warn:', error.message);
     return null;
   }
   return data ?? null;
 }
 
-/* -------------------- normalize row for trades -------------------- */
+/* -------------------- NORMALIZE -------------------- */
 function normalizeTradeRow(row) {
   return {
     id: row.id,
@@ -99,35 +96,40 @@ function normalizeTradeRow(row) {
 }
 
 /* -------------------- API -------------------- */
-
-// OPENED: calcule margin + buckets avant upsert
+/**
+ * OPENED:
+ * margin_usd6 = ceil( (qty1e18 * priceX6 / 1e18) / leverage )
+ * avec qty1e18 = lots * 1e18 * lot_num / lot_den
+ * (lot_num/lot_den viennent de la table assets, ex: BTC 1/100 => 0.01 BTC / lot)
+ */
 export async function upsertOpened(rowIn) {
+  // 1) Asset & ratios lot
   const asset = await getAsset(rowIn.asset_id);
   if (!asset) {
     logErr('upsertOpened', { message: 'asset_id not found in assets (FK)' }, rowIn);
     return { ok: false };
   }
 
-  // lots & leverage
-  const lots = BigInt(rowIn.lots ?? 0);
-  const lev = BigInt(rowIn.leverage_x ?? 1);
+  const lots = toBI(rowIn.lots ?? 0);
+  const lev  = toBI(rowIn.leverage_x ?? 1);
 
-  // lot_num/lot_den (numeric) → BigInt
-  // on accepte lot_num/lot_den null => 1/1
-  const lotNum = toBigIntSafe(asset.lot_num ?? '1');
-  const lotDen = toBigIntSafe(asset.lot_den ?? '1');
-  const priceX6 = rowIn.state === 'OPEN' ? toBigIntSafe(rowIn.entry_x6) : toBigIntSafe(rowIn.target_x6);
+  // lot_num / lot_den peuvent être NUMERIC → on les convertit en BigInt proprement
+  const lotNum = toBI(asset.lot_num ?? '1'); // ex: '1'
+  const lotDen = toBI(asset.lot_den ?? '1'); // ex: '100'
+  const priceX6 = rowIn.state === 'OPEN'
+    ? toBI(rowIn.entry_x6)
+    : toBI(rowIn.target_x6);
 
   // qty1e18 = lots * 1e18 * lotNum / lotDen
-  const qty1e18 = lotDen === 0n ? 0n : (lots * WAD * lotNum) / lotDen;
+  const qty1e18 = (lotDen === 0n) ? 0n : (lots * WAD * lotNum) / lotDen;
 
-  // notional(USD6) = qty1e18 * price1e6 / 1e18
+  // notional(USD6) = qty1e18 * priceX6 / 1e18
   const notionalUsd6 = (qty1e18 * priceX6) / WAD;
 
-  // margin = ceil(notional / lev)
-  const marginUsd6 = lev === 0n ? 0n : ceilDiv(notionalUsd6, lev);
+  // margin = ceil(notional / leverage)
+  const marginUsd6 = (lev === 0n) ? 0n : ceilDiv(notionalUsd6, lev);
 
-  // buckets
+  // 2) Buckets (ticks)
   const [target_bucket, sl_bucket, tp_bucket, liq_bucket] = await Promise.all([
     rowIn.state === 'ORDER' ? priceToBucket(rowIn.asset_id, rowIn.target_x6) : Promise.resolve(null),
     rowIn.sl_x6 && rowIn.sl_x6 !== '0' ? priceToBucket(rowIn.asset_id, rowIn.sl_x6) : Promise.resolve(null),
@@ -135,15 +137,17 @@ export async function upsertOpened(rowIn) {
     rowIn.liq_x6 && rowIn.liq_x6 !== '0' ? priceToBucket(rowIn.asset_id, rowIn.liq_x6) : Promise.resolve(null),
   ]);
 
+  // 3) Upsert
   const row = normalizeTradeRow({
     ...rowIn,
-    // écrase avec les valeurs calculées
     leverage_x: Number(lev),
     margin_usd6: Number(marginUsd6),
     target_bucket, sl_bucket, tp_bucket, liq_bucket,
   });
 
-  const { data, error } = await supa.from('trades').upsert(row, { onConflict: 'id' });
+  const { data, error } = await supa
+    .from('trades')
+    .upsert(row, { onConflict: 'id' });
   logErr('upsertOpened', error, row);
   return { ok: !error, data };
 }
@@ -167,12 +171,12 @@ export async function updateStops({ id, sl_x6, tp_x6, asset_id, tx_hash, block_n
 
   try {
     if (asset_id && sl_x6 && sl_x6 !== '0') {
-      const r = await supa.rpc('price_to_bucket', { _asset_id: asset_id, _price_x6: sl_x6 });
-      if (!r.error) sl_bucket = r.data ?? null;
+      const r1 = await supa.rpc('price_to_bucket', { _asset_id: asset_id, _price_x6: sl_x6 });
+      if (!r1.error) sl_bucket = r1.data ?? null;
     }
     if (asset_id && tp_x6 && tp_x6 !== '0') {
-      const r = await supa.rpc('price_to_bucket', { _asset_id: asset_id, _price_x6: tp_x6 });
-      if (!r.error) tp_bucket = r.data ?? null;
+      const r2 = await supa.rpc('price_to_bucket', { _asset_id: asset_id, _price_x6: tp_x6 });
+      if (!r2.error) tp_bucket = r2.data ?? null;
     }
   } catch (e) {
     console.warn('[Supabase] updateStops bucket compute warn:', e?.message);
@@ -216,3 +220,4 @@ export async function testConnection() {
   if (error) console.error('[Supabase] ❌ Connection failed:', error.message);
   else console.log('[Supabase] ✅ Connection OK, sample length:', data?.length ?? 0);
 }
+
