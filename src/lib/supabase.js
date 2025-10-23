@@ -1,20 +1,13 @@
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
 
-/**
- * CONFIG
- * - Utilise la Service Role Key si disponible (recommandé côté serveur)
- * - sinon fallback sur l'ANON (mais alors il te faut des policies INSERT/UPDATE)
- */
-const SUPABASE_URL =
-  process.env.SUPABASE_URL || 'https://ighyvkabamlunuikorwc.supabase.co';
-
+/* -------------------- CONFIG -------------------- */
+const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY =
-  process.env.SUPABASE_SERVICE_ROLE || // ✅ recommandé (bypass RLS)
-  process.env.SUPABASE_ANON_KEY;       // ⚠️ nécessite des policies write
+  process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_ANON_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error('[Supabase] ❌ Missing SUPABASE_URL or key (SERVICE_ROLE/ANON)');
+  console.error('[Supabase] ❌ Missing SUPABASE_URL or SUPABASE_* key in .env');
   process.exit(1);
 }
 
@@ -22,7 +15,7 @@ export const supa = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: false },
 });
 
-/** Logs d’erreur utiles */
+/* -------------------- LOG UTILS -------------------- */
 function logErr(prefix, error, extra) {
   if (!error) return;
   console.error(`[Supabase] ${prefix} ERROR ->`, {
@@ -34,39 +27,73 @@ function logErr(prefix, error, extra) {
   });
 }
 
-/**
- * HELPERS
- * - on reste collé au schéma:
- *   trades(state enum: ORDER|OPEN|CLOSED|CANCELLED, removed_reason enum: CANCELLED|MARKET|SL|TP|LIQ)
- * - pas de colonnes exec_x6 / pnl_usd6 (elles n'existent pas dans la table)
- */
-export async function upsertOpened(row) {
-  // row doit contenir au minimum: id, owner_addr, asset_id, long_side, lots, leverage_x, margin_usd6, state, entry_x6/target_x6, sl_x6, tp_x6, liq_x6
-  const { data, error } = await supa.from('trades').upsert(row, { onConflict: 'id' });
-  logErr('upsertOpened', error, row);
-  return { ok: !error, data };
+/* -------------------- HELPERS -------------------- */
+/** Coerce/clean rows for `trades` to match schema */
+function normalizeTradeRow(row) {
+  return {
+    id: row.id,
+    owner_addr: row.owner_addr ?? '0x',
+    asset_id: row.asset_id,
+    long_side: !!row.long_side,
+    lots: Number(row.lots ?? 0),
+    leverage_x: Number(row.leverage_x ?? 1),          // fallback: 1 (colonne NOT NULL)
+    margin_usd6: row.margin_usd6 ?? 0,
+
+    state: row.state,                                  // 'ORDER' | 'OPEN' | 'CLOSED' | 'CANCELLED'
+
+    entry_x6: row.entry_x6 ?? 0,
+    target_x6: row.target_x6 ?? 0,
+    sl_x6: row.sl_x6 ?? 0,
+    tp_x6: row.tp_x6 ?? 0,
+    liq_x6: row.liq_x6 ?? 0,
+
+    // noms alignés avec le schéma:
+    last_tx_hash: row.tx_hash ?? row.last_tx_hash ?? null,
+    last_block_num: row.block_num ?? row.last_block_num ?? null,
+
+    // buckets si déjà calculés en amont (sinon laissés à null)
+    target_bucket: row.target_bucket ?? null,
+    sl_bucket: row.sl_bucket ?? null,
+    tp_bucket: row.tp_bucket ?? null,
+    liq_bucket: row.liq_bucket ?? null,
+  };
 }
 
-export async function markExecuted({ id, entry_x6, tx_hash, block_num }) {
+/* -------------------- API -------------------- */
+
+// 🔹 Nouvelle position (Opened)
+export async function upsertOpened(row) {
+  const clean = normalizeTradeRow(row);
   const { data, error } = await supa
     .from('trades')
-    .update({
-      state: 'OPEN',
-      entry_x6,
-      executed_at: new Date().toISOString(),
-      last_tx_hash: tx_hash,
-      last_block_num: block_num,
-    })
-    .eq('id', id);
-  logErr('markExecuted', error, { id, entry_x6 });
+    .upsert(clean, { onConflict: 'id' });
+  logErr('upsertOpened', error, clean);
   return { ok: !error, data };
 }
 
+// 🔹 Marquer ordre exécuté (ORDER -> OPEN)
+export async function markExecuted({ id, entry_x6, tx_hash, block_num }) {
+  const patch = {
+    state: 'OPEN',
+    entry_x6,
+    executed_at: new Date().toISOString(),
+    last_tx_hash: tx_hash ?? null,
+    last_block_num: block_num ?? null,
+  };
+  const { data, error } = await supa
+    .from('trades')
+    .update(patch)
+    .eq('id', id);
+  logErr('markExecuted', error, { id, patch });
+  return { ok: !error, data };
+}
+
+// 🔹 Mise à jour SL/TP (+ recompute buckets si la RPC existe)
 export async function updateStops({ id, sl_x6, tp_x6, asset_id, tx_hash, block_num }) {
-  // met à jour stops + recompute buckets via la RPC price_to_bucket si elle existe
   let sl_bucket = null;
   let tp_bucket = null;
 
+  // calcul buckets (si la RPC 'price_to_bucket' est créée)
   try {
     if (asset_id && sl_x6 && sl_x6 !== '0') {
       const r = await supa.rpc('price_to_bucket', { _asset_id: asset_id, _price_x6: sl_x6 });
@@ -80,23 +107,25 @@ export async function updateStops({ id, sl_x6, tp_x6, asset_id, tx_hash, block_n
     console.warn('[Supabase] updateStops bucket compute warn:', e?.message);
   }
 
+  const patch = {
+    sl_x6: sl_x6 || 0,
+    tp_x6: tp_x6 || 0,
+    sl_bucket,
+    tp_bucket,
+    last_tx_hash: tx_hash ?? null,
+    last_block_num: block_num ?? null,
+  };
+
   const { data, error } = await supa
     .from('trades')
-    .update({
-      sl_x6: sl_x6 || 0,
-      tp_x6: tp_x6 || 0,
-      sl_bucket,
-      tp_bucket,
-      last_tx_hash: tx_hash,
-      last_block_num: block_num,
-    })
+    .update(patch)
     .eq('id', id);
-  logErr('updateStops', error, { id, sl_x6, tp_x6, asset_id });
+  logErr('updateStops', error, { id, patch });
   return { ok: !error, data };
 }
 
 /**
- * Removed (fermeture OU annulation)
+ * 🔹 Removed (fermeture OU annulation)
  * - state = 'CANCELLED' si reason == 0
  * - state = 'CLOSED' sinon
  * - removed_reason = 'CANCELLED' | 'MARKET' | 'SL' | 'TP' | 'LIQ'
@@ -106,31 +135,34 @@ export async function markRemoved({ id, reason, tx_hash, block_num }) {
   const removed_reason = reasonMap[Number(reason)] ?? 'CANCELLED';
   const state = removed_reason === 'CANCELLED' ? 'CANCELLED' : 'CLOSED';
 
-  const fields = {
+  const patch = {
     state,
-    removed_reason,          // enum remove_reason
-    last_tx_hash: tx_hash,
-    last_block_num: block_num,
+    removed_reason,                 // enum remove_reason
+    last_tx_hash: tx_hash ?? null,
+    last_block_num: block_num ?? null,
   };
 
   if (state === 'CLOSED') {
-    fields.closed_at = new Date().toISOString();
+    patch.closed_at = new Date().toISOString();
   } else {
-    fields.cancelled_at = new Date().toISOString();
+    patch.cancelled_at = new Date().toISOString();
   }
 
-  const { data, error } = await supa.from('trades').update(fields).eq('id', id);
-  logErr('markRemoved', error, { id, reason, removed_reason, state });
+  const { data, error } = await supa
+    .from('trades')
+    .update(patch)
+    .eq('id', id);
+  logErr('markRemoved', error, { id, patch });
   return { ok: !error, data };
 }
 
-/** Health check */
+/* -------------------- HEALTH -------------------- */
 export async function testConnection() {
   const { data, error } = await supa.from('trades').select('id').limit(1);
   if (error) {
     console.error('[Supabase] ❌ Connection failed:', error.message);
   } else {
-    console.log('[Supabase] ✅ Connection OK, trades count probe:', data?.length ?? 0);
+    console.log('[Supabase] ✅ Connection OK, sample length:', data?.length ?? 0);
   }
 }
 
