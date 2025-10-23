@@ -1,5 +1,8 @@
 import { makeProvider, makeContract, extractTxMeta } from '../lib/provider.js';
 import { markRemoved } from '../lib/supabase.js';
+import { EventCache } from '../lib/cache.js';
+
+const cache = new EventCache();
 
 const main = async () => {
   const provider = makeProvider();
@@ -11,6 +14,10 @@ const main = async () => {
     try {
       const event = args[args.length - 1];
       const { txHash, blockNum } = extractTxMeta(event);
+      const key = `removed:${txHash}`;
+      if (cache.has(key)) return;
+      cache.add(key);
+
       const [id, reason, execX6, pnlUsd6] = args;
 
       await markRemoved({
@@ -27,14 +34,6 @@ const main = async () => {
       console.error('[listener/removed] handler error', e);
     }
   });
-
-  provider._websocket?.on?.('close', (code) => {
-    console.error('[listener/removed] WS closed', code);
-    process.exit(1);
-  });
 };
 
-main().catch((e) => {
-  console.error('[listener/removed] fatal', e);
-  process.exit(1);
-});
+main().catch(console.error);
