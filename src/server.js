@@ -1,13 +1,15 @@
 import express from 'express';
 import cors from 'cors';
-import tradesRoutes from './api/trades.js';
+import routes from './api/index.js';
 
 const app = express();
-app.use(cors());
 app.use(express.json());
+app.use(cors({ origin: '*' })); // Autorise tous les domaines (public API)
 
-app.get('/', (_, res) => res.json({ status: 'ok', message: 'Brokex API live 🧠' }));
-app.use('/trades', tradesRoutes);
+// Routeur principal
+app.use('/', routes);
 
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`[API] Listening on port ${PORT}`));
+const PORT = 9312;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Brokex API listening on http://51.178.182.7:${PORT}`);
+});
