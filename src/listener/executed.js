@@ -1,5 +1,8 @@
 import { makeProvider, makeContract, extractTxMeta } from '../lib/provider.js';
 import { markExecuted } from '../lib/supabase.js';
+import { EventCache } from '../lib/cache.js';
+
+const cache = new EventCache();
 
 const main = async () => {
   const provider = makeProvider();
@@ -11,6 +14,10 @@ const main = async () => {
     try {
       const event = args[args.length - 1];
       const { txHash, blockNum } = extractTxMeta(event);
+      const key = `executed:${txHash}`;
+      if (cache.has(key)) return;
+      cache.add(key);
+
       const [id, entryX6] = args;
 
       await markExecuted({
@@ -20,19 +27,11 @@ const main = async () => {
         block_num: blockNum
       });
 
-      console.log('[Executed]', { id: Number(id), entryX6: entryX6.toString(), txHash });
+      console.log('[Executed]', { id: Number(id), txHash });
     } catch (e) {
       console.error('[listener/executed] handler error', e);
     }
   });
-
-  provider._websocket?.on?.('close', (code) => {
-    console.error('[listener/executed] WS closed', code);
-    process.exit(1);
-  });
 };
 
-main().catch((e) => {
-  console.error('[listener/executed] fatal', e);
-  process.exit(1);
-});
+main().catch(console.error);
