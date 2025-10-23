@@ -1,13 +1,12 @@
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
 
-/* -------------------- CONFIG -------------------- */
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY =
   process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_ANON_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error('[Supabase] ❌ Missing SUPABASE_URL or SUPABASE_* key in .env');
+  console.error('[Supabase] ❌ Missing SUPABASE_URL or SUPABASE_* key');
   process.exit(1);
 }
 
@@ -15,7 +14,6 @@ export const supa = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: false },
 });
 
-/* -------------------- LOG UTILS -------------------- */
 function logErr(prefix, error, extra) {
   if (!error) return;
   console.error(`[Supabase] ${prefix} ERROR ->`, {
@@ -27,8 +25,51 @@ function logErr(prefix, error, extra) {
   });
 }
 
-/* -------------------- HELPERS -------------------- */
-/** Coerce/clean rows for `trades` to match schema */
+/* -------------------- helpers assets & math -------------------- */
+
+async function getAsset(asset_id) {
+  const { data, error } = await supa
+    .from('assets')
+    .select('id,tick_x6,lot_num,lot_den')
+    .eq('id', asset_id)
+    .maybeSingle();
+  if (error) {
+    console.warn('[Supabase] getAsset warn', error.message);
+  }
+  return data || null;
+}
+
+const WAD = 10n ** 18n;
+
+function toBigIntSafe(v) {
+  if (v === null || v === undefined) return 0n;
+  if (typeof v === 'bigint') return v;
+  if (typeof v === 'number') return BigInt(Math.trunc(v));
+  if (typeof v === 'string') return v.length ? BigInt(v) : 0n;
+  return 0n;
+}
+
+// ceilDiv for BigInt
+function ceilDiv(a, b) {
+  return (a + (b - 1n)) / b;
+}
+
+/* -------------------- buckets via RPC -------------------- */
+async function priceToBucket(asset_id, price_x6) {
+  const px = toBigIntSafe(price_x6);
+  if (px === 0n) return null;
+  const { data, error } = await supa.rpc('price_to_bucket', {
+    _asset_id: asset_id,
+    _price_x6: px.toString(),
+  });
+  if (error) {
+    console.warn('[Supabase] price_to_bucket warn', error.message);
+    return null;
+  }
+  return data ?? null;
+}
+
+/* -------------------- normalize row for trades -------------------- */
 function normalizeTradeRow(row) {
   return {
     id: row.id,
@@ -36,10 +77,10 @@ function normalizeTradeRow(row) {
     asset_id: row.asset_id,
     long_side: !!row.long_side,
     lots: Number(row.lots ?? 0),
-    leverage_x: Number(row.leverage_x ?? 1),          // fallback: 1 (colonne NOT NULL)
-    margin_usd6: row.margin_usd6 ?? 0,
+    leverage_x: Number(row.leverage_x ?? 1),
+    margin_usd6: Number(row.margin_usd6 ?? 0),
 
-    state: row.state,                                  // 'ORDER' | 'OPEN' | 'CLOSED' | 'CANCELLED'
+    state: row.state, // 'ORDER' | 'OPEN' | 'CLOSED' | 'CANCELLED'
 
     entry_x6: row.entry_x6 ?? 0,
     target_x6: row.target_x6 ?? 0,
@@ -47,11 +88,9 @@ function normalizeTradeRow(row) {
     tp_x6: row.tp_x6 ?? 0,
     liq_x6: row.liq_x6 ?? 0,
 
-    // noms alignés avec le schéma:
-    last_tx_hash: row.tx_hash ?? row.last_tx_hash ?? null,
-    last_block_num: row.block_num ?? row.last_block_num ?? null,
+    last_tx_hash: row.last_tx_hash ?? null,
+    last_block_num: row.last_block_num ?? null,
 
-    // buckets si déjà calculés en amont (sinon laissés à null)
     target_bucket: row.target_bucket ?? null,
     sl_bucket: row.sl_bucket ?? null,
     tp_bucket: row.tp_bucket ?? null,
@@ -61,17 +100,54 @@ function normalizeTradeRow(row) {
 
 /* -------------------- API -------------------- */
 
-// 🔹 Nouvelle position (Opened)
-export async function upsertOpened(row) {
-  const clean = normalizeTradeRow(row);
-  const { data, error } = await supa
-    .from('trades')
-    .upsert(clean, { onConflict: 'id' });
-  logErr('upsertOpened', error, clean);
+// OPENED: calcule margin + buckets avant upsert
+export async function upsertOpened(rowIn) {
+  const asset = await getAsset(rowIn.asset_id);
+  if (!asset) {
+    logErr('upsertOpened', { message: 'asset_id not found in assets (FK)' }, rowIn);
+    return { ok: false };
+  }
+
+  // lots & leverage
+  const lots = BigInt(rowIn.lots ?? 0);
+  const lev = BigInt(rowIn.leverage_x ?? 1);
+
+  // lot_num/lot_den (numeric) → BigInt
+  // on accepte lot_num/lot_den null => 1/1
+  const lotNum = toBigIntSafe(asset.lot_num ?? '1');
+  const lotDen = toBigIntSafe(asset.lot_den ?? '1');
+  const priceX6 = rowIn.state === 'OPEN' ? toBigIntSafe(rowIn.entry_x6) : toBigIntSafe(rowIn.target_x6);
+
+  // qty1e18 = lots * 1e18 * lotNum / lotDen
+  const qty1e18 = lotDen === 0n ? 0n : (lots * WAD * lotNum) / lotDen;
+
+  // notional(USD6) = qty1e18 * price1e6 / 1e18
+  const notionalUsd6 = (qty1e18 * priceX6) / WAD;
+
+  // margin = ceil(notional / lev)
+  const marginUsd6 = lev === 0n ? 0n : ceilDiv(notionalUsd6, lev);
+
+  // buckets
+  const [target_bucket, sl_bucket, tp_bucket, liq_bucket] = await Promise.all([
+    rowIn.state === 'ORDER' ? priceToBucket(rowIn.asset_id, rowIn.target_x6) : Promise.resolve(null),
+    rowIn.sl_x6 && rowIn.sl_x6 !== '0' ? priceToBucket(rowIn.asset_id, rowIn.sl_x6) : Promise.resolve(null),
+    rowIn.tp_x6 && rowIn.tp_x6 !== '0' ? priceToBucket(rowIn.asset_id, rowIn.tp_x6) : Promise.resolve(null),
+    rowIn.liq_x6 && rowIn.liq_x6 !== '0' ? priceToBucket(rowIn.asset_id, rowIn.liq_x6) : Promise.resolve(null),
+  ]);
+
+  const row = normalizeTradeRow({
+    ...rowIn,
+    // écrase avec les valeurs calculées
+    leverage_x: Number(lev),
+    margin_usd6: Number(marginUsd6),
+    target_bucket, sl_bucket, tp_bucket, liq_bucket,
+  });
+
+  const { data, error } = await supa.from('trades').upsert(row, { onConflict: 'id' });
+  logErr('upsertOpened', error, row);
   return { ok: !error, data };
 }
 
-// 🔹 Marquer ordre exécuté (ORDER -> OPEN)
 export async function markExecuted({ id, entry_x6, tx_hash, block_num }) {
   const patch = {
     state: 'OPEN',
@@ -80,20 +156,15 @@ export async function markExecuted({ id, entry_x6, tx_hash, block_num }) {
     last_tx_hash: tx_hash ?? null,
     last_block_num: block_num ?? null,
   };
-  const { data, error } = await supa
-    .from('trades')
-    .update(patch)
-    .eq('id', id);
+  const { data, error } = await supa.from('trades').update(patch).eq('id', id);
   logErr('markExecuted', error, { id, patch });
   return { ok: !error, data };
 }
 
-// 🔹 Mise à jour SL/TP (+ recompute buckets si la RPC existe)
 export async function updateStops({ id, sl_x6, tp_x6, asset_id, tx_hash, block_num }) {
   let sl_bucket = null;
   let tp_bucket = null;
 
-  // calcul buckets (si la RPC 'price_to_bucket' est créée)
   try {
     if (asset_id && sl_x6 && sl_x6 !== '0') {
       const r = await supa.rpc('price_to_bucket', { _asset_id: asset_id, _price_x6: sl_x6 });
@@ -116,20 +187,11 @@ export async function updateStops({ id, sl_x6, tp_x6, asset_id, tx_hash, block_n
     last_block_num: block_num ?? null,
   };
 
-  const { data, error } = await supa
-    .from('trades')
-    .update(patch)
-    .eq('id', id);
+  const { data, error } = await supa.from('trades').update(patch).eq('id', id);
   logErr('updateStops', error, { id, patch });
   return { ok: !error, data };
 }
 
-/**
- * 🔹 Removed (fermeture OU annulation)
- * - state = 'CANCELLED' si reason == 0
- * - state = 'CLOSED' sinon
- * - removed_reason = 'CANCELLED' | 'MARKET' | 'SL' | 'TP' | 'LIQ'
- */
 export async function markRemoved({ id, reason, tx_hash, block_num }) {
   const reasonMap = ['CANCELLED', 'MARKET', 'SL', 'TP', 'LIQ'];
   const removed_reason = reasonMap[Number(reason)] ?? 'CANCELLED';
@@ -137,32 +199,20 @@ export async function markRemoved({ id, reason, tx_hash, block_num }) {
 
   const patch = {
     state,
-    removed_reason,                 // enum remove_reason
+    removed_reason,
     last_tx_hash: tx_hash ?? null,
     last_block_num: block_num ?? null,
   };
+  if (state === 'CLOSED') patch.closed_at = new Date().toISOString();
+  else patch.cancelled_at = new Date().toISOString();
 
-  if (state === 'CLOSED') {
-    patch.closed_at = new Date().toISOString();
-  } else {
-    patch.cancelled_at = new Date().toISOString();
-  }
-
-  const { data, error } = await supa
-    .from('trades')
-    .update(patch)
-    .eq('id', id);
+  const { data, error } = await supa.from('trades').update(patch).eq('id', id);
   logErr('markRemoved', error, { id, patch });
   return { ok: !error, data };
 }
 
-/* -------------------- HEALTH -------------------- */
 export async function testConnection() {
   const { data, error } = await supa.from('trades').select('id').limit(1);
-  if (error) {
-    console.error('[Supabase] ❌ Connection failed:', error.message);
-  } else {
-    console.log('[Supabase] ✅ Connection OK, sample length:', data?.length ?? 0);
-  }
+  if (error) console.error('[Supabase] ❌ Connection failed:', error.message);
+  else console.log('[Supabase] ✅ Connection OK, sample length:', data?.length ?? 0);
 }
-
