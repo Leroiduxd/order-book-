@@ -1,5 +1,8 @@
 import { makeProvider, makeContract, extractTxMeta } from '../lib/provider.js';
 import { supa, updateStops } from '../lib/supabase.js';
+import { EventCache } from '../lib/cache.js';
+
+const cache = new EventCache();
 
 const main = async () => {
   const provider = makeProvider();
@@ -11,9 +14,12 @@ const main = async () => {
     try {
       const event = args[args.length - 1];
       const { txHash, blockNum } = extractTxMeta(event);
+      const key = `stops:${txHash}`;
+      if (cache.has(key)) return;
+      cache.add(key);
+
       const [id, slX6, tpX6] = args;
 
-      // récup asset_id pour buckets
       const { data, error } = await supa.from('trades').select('asset_id').eq('id', Number(id)).single();
       if (error) throw error;
 
@@ -31,14 +37,6 @@ const main = async () => {
       console.error('[listener/stops] handler error', e);
     }
   });
-
-  provider._websocket?.on?.('close', (code) => {
-    console.error('[listener/stops] WS closed', code);
-    process.exit(1);
-  });
 };
 
-main().catch((e) => {
-  console.error('[listener/stops] fatal', e);
-  process.exit(1);
-});
+main().catch(console.error);
