@@ -12,7 +12,7 @@ router.get('/by-trader/:address', async (req, res) => {
     const { data, error } = await supa
       .from('trades')
       .select('*')
-      .eq('owner_addr', addr)
+      .ilike('owner_addr', addr)
       .order('id', { ascending: false });
 
     if (error) throw error;
